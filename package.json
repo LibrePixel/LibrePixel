@@ -1,0 +1,28 @@
+{
+  "name": "librepixel",
+  "version": "0.1.0",
+  "description": "Self-hosted photo backup server. Keeps your originals on your own storage.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "librepixel": "./dist/bin/librepixel.js"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "check:brand": "node scripts/check-brand.ts",
+    "test": "npm run check:brand && npm run typecheck && node --test 'test/*.test.ts'",
+    "start": "node bin/librepixel.ts serve",
+    "prepare": "npm run build"
+  },
+  "files": [
+    "dist/"
+  ],
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "typescript": "^7.0.2"
+  }
+}
