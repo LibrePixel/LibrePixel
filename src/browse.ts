@@ -1,3 +1,4 @@
+import { createHmac } from 'node:crypto';
 import type { OutgoingHttpHeaders } from 'node:http';
 import type { Readable } from 'node:stream';
 
@@ -9,7 +10,9 @@ import type { RateLimiter } from './ratelimit.ts';
 import type { AssetDetail, Index, RecentAsset } from './sqlite.ts';
 
 export interface BrowseRequest {
+  method?: string;
   headers: Record<string, string | string[] | undefined>;
+  [Symbol.asyncIterator]?(): AsyncIterator<Uint8Array | string>;
 }
 
 export interface BrowseResponse extends NodeJS.WritableStream {
@@ -19,6 +22,30 @@ export interface BrowseResponse extends NodeJS.WritableStream {
 
 export interface BlobReader {
   openRead(hash: string): Promise<{ stream: Readable; size: number } | null>;
+}
+
+/** A file stored through another protocol served at the same address. */
+export interface AlbumFile {
+  name: string;
+  size: number;
+  /** Unix seconds. */
+  uploadedAt: number;
+  /** Opens the file in the browser; used as the thumbnail for images. */
+  url: string;
+  /** Downloads the file. */
+  download: string;
+  kind: 'image' | 'video' | 'file';
+}
+
+/** Another protocol served at the same address, shown next to LibrePixel's own photos. */
+export interface AlbumSource {
+  /** Used in `?source=`. */
+  id: string;
+  /** Shown on tiles, tabs and in "Connect the app". */
+  name: string;
+  /** Label/value rows telling the app how to connect. */
+  connect: [label: string, value: string][];
+  files(limit: number): Promise<{ total: number; files: AlbumFile[] }>;
 }
 
 export interface BrowseContext {
@@ -31,30 +58,83 @@ export interface BrowseContext {
   limiter?: RateLimiter;
   clientIp?: string;
   setupQR?: boolean;
+  /** Help shown after a wrong password. Plain text; an empty string shows none. */
   passwordHint?: string;
+  /** Other protocols at this address. Their files join the library, with a tab per source. */
+  sources?: AlbumSource[];
+  /** Mark the session cookie Secure. Defaults to true when the origin is https. */
+  secureCookie?: boolean;
+  /** Key for session cookies. Defaults to the token; sessions always end when the token changes. */
+  sessionSecret?: string;
 }
 
-type ConnectContext = Pick<BrowseContext, 'origin' | 'token' | 'mode' | 'maxUploadBytes' | 'setupQR'> & {
+type ConnectContext = Pick<BrowseContext, 'origin' | 'token' | 'mode' | 'maxUploadBytes' | 'setupQR' | 'sources'> & {
   first?: boolean;
 };
 
 export function browseHandles(method: string | undefined, pathname: string): boolean {
+  if (method === 'POST') return pathname === '/login' || pathname === '/logout';
   if (method !== 'GET') return false;
   return (
     pathname === '/' ||
+    pathname === '/login' ||
     pathname === '/favicon.ico' ||
     pathname.startsWith('/photo/') ||
     pathname.startsWith('/v1/blob/')
   );
 }
 
-function browseAuthorized(req: BrowseRequest, token: string): boolean {
-  const header = String(req.headers['authorization'] ?? '');
-  if (header.startsWith('Bearer ')) return sameSecret(header.slice(7), token);
-  if (header.startsWith('Basic ')) {
+const SESSION_COOKIE = 'librepixel_session';
+const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
+
+type Headers = BrowseRequest['headers'];
+const header = (headers: Headers, name: string): string => {
+  const value = headers[name];
+  return Array.isArray(value) ? value.join(', ') : String(value ?? '');
+};
+
+function sessionMac(expires: number, token: string, secret = token): string {
+  return createHmac('sha256', secret).update(`librepixel-session\n${expires}\n${token}`).digest('base64url');
+}
+
+function sessionCookie(token: string, secret: string | undefined, secure: boolean, now = Date.now()): string {
+  const expires = Math.floor(now / 1000) + SESSION_TTL_SECONDS;
+  return (
+    `${SESSION_COOKIE}=${expires}.${sessionMac(expires, token, secret)}; Path=/; Max-Age=${SESSION_TTL_SECONDS}; ` +
+    `HttpOnly; SameSite=Lax${secure ? '; Secure' : ''}`
+  );
+}
+
+const clearedCookie = (secure: boolean): string =>
+  `${SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax${secure ? '; Secure' : ''}`;
+
+function sessionValue(headers: Headers): string | null {
+  for (const part of header(headers, 'cookie').split(';')) {
+    const at = part.indexOf('=');
+    if (at > 0 && part.slice(0, at).trim() === SESSION_COOKIE) return part.slice(at + 1).trim();
+  }
+  return null;
+}
+
+function validSession(value: string | null, token: string, secret?: string, now = Date.now()): boolean {
+  const match = /^(\d{1,12})\.([\w-]{43})$/.exec(value ?? '');
+  if (!match) return false;
+  const expires = Number(match[1]);
+  return expires > now / 1000 && sameSecret(match[2], sessionMac(expires, token, secret));
+}
+
+/**
+ * Whether a request may see the browse pages and originals: a session cookie from the sign-in
+ * page, or the token as Bearer or Basic auth (any username).
+ */
+export function browseAuthorized(req: Pick<BrowseRequest, 'headers'>, token: string, sessionSecret?: string): boolean {
+  if (validSession(sessionValue(req.headers), token, sessionSecret)) return true;
+  const auth = header(req.headers, 'authorization');
+  if (auth.startsWith('Bearer ')) return sameSecret(auth.slice(7), token);
+  if (auth.startsWith('Basic ')) {
     let decoded = '';
     try {
-      decoded = Buffer.from(header.slice(6), 'base64').toString('utf8');
+      decoded = Buffer.from(auth.slice(6), 'base64').toString('utf8');
     } catch {
       return false;
     }
@@ -64,6 +144,35 @@ function browseAuthorized(req: BrowseRequest, token: string): boolean {
     return sameSecret(pass, token) || sameSecret(user, token);
   }
   return false;
+}
+
+/** Whether a request carries a credential at all (right or wrong), so it counts toward rate limits. */
+export const presentsCredential = (req: Pick<BrowseRequest, 'headers'>): boolean =>
+  header(req.headers, 'authorization') !== '' || sessionValue(req.headers) !== null;
+
+/** Only same-site paths: never `//host` or `/\\host`, which browsers treat as another site. */
+function safeNext(raw: string | null | undefined): string {
+  const next = String(raw ?? '');
+  return next.startsWith('/') && !next.startsWith('//') && !next.startsWith('/\\') && !/[\r\n]/.test(next) ? next : '/';
+}
+
+const MAX_FORM_BYTES = 4096;
+
+async function readForm(req: BrowseRequest): Promise<URLSearchParams | null> {
+  const iterator = req[Symbol.asyncIterator]?.();
+  if (!iterator) return new URLSearchParams();
+  const decoder = new TextDecoder();
+  let text = '';
+  for (;;) {
+    const { value, done } = await iterator.next();
+    if (done) break;
+    text += typeof value === 'string' ? value : decoder.decode(value, { stream: true });
+    if (text.length > MAX_FORM_BYTES) {
+      await iterator.return?.();
+      return null;
+    }
+  }
+  return new URLSearchParams(text + decoder.decode());
 }
 
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -109,13 +218,6 @@ function humanTime(sec: number): string {
   const hh = String(d.getUTCHours()).padStart(2, '0');
   const mm = String(d.getUTCMinutes()).padStart(2, '0');
   return `${MONTHS[d.getUTCMonth()].slice(0, 3)} ${d.getUTCDate()}, ${d.getUTCFullYear()} at ${hh}:${mm} UTC`;
-}
-
-function monthOf(row: Pick<RecentAsset, 'captured_at' | 'uploaded_at'>): string {
-  const sec = Number(row.captured_at) || Number(row.uploaded_at) || 0;
-  if (sec <= 0) return 'Undated';
-  const d = new Date(sec * 1000);
-  return `${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
 }
 
 const items = (n: number): string => `${Number(n).toLocaleString('en-US')} ${Number(n) === 1 ? 'item' : 'items'}`;
@@ -266,6 +368,29 @@ code { font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; padding: 1px 5
   padding: 2px 7px; border-radius: 999px; background: var(--badge-bg); color: var(--badge-ink);
   font-size: 11px; font-weight: 700; letter-spacing: .04em; line-height: 16px; }
 .more { font-size: 13px; color: var(--muted); text-align: center; }
+.src { position: absolute; left: 8px; bottom: 8px; padding: 2px 8px; border-radius: 999px;
+  background: rgba(28,28,26,.72); color: #FFFFFF; font-size: 11px; font-weight: 600; line-height: 16px; }
+.tile.noimg .src { background: var(--chip); color: var(--ink-2); }
+.tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+.tab { display: inline-flex; align-items: center; gap: 6px; height: 36px; padding: 0 14px; border-radius: 18px;
+  font-size: 14px; font-weight: 600; background: var(--surface); color: var(--ink-2);
+  box-shadow: inset 0 0 0 1px var(--field-line); }
+.tab:hover { text-decoration: none; background: var(--chip); }
+.tab span { font-weight: 500; opacity: .8; font-variant-numeric: tabular-nums; }
+.tab[aria-current="page"] { background: var(--accent); color: var(--on-accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.signout button { min-height: 36px; padding: 0 12px; border: 0; border-radius: 10px; background: none; cursor: pointer;
+  font: inherit; font-size: 14px; font-weight: 500; color: var(--ink-2); }
+.signout button:hover { background: var(--chip); }
+.ways { padding: 4px 20px 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+.way { border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; }
+.way b { font-size: 14px; font-weight: 700; }
+.way div { display: flex; gap: 10px; font-size: 13px; line-height: 19px; }
+.way span { width: 72px; flex-shrink: 0; color: var(--muted); }
+.way code { padding: 0; background: none; min-width: 0; overflow-wrap: anywhere; color: var(--ink); }
+.ways-note { padding: 12px 20px 0; font-size: 13px; line-height: 19px; color: var(--muted); }
+.first .ways { padding: 28px 28px 0; }
+.first .ways-note { padding: 12px 28px 0; }
+.or { font-size: 14px; line-height: 21px; color: var(--ink-3); }
 
 .photo { padding-top: 24px; padding-bottom: 48px; display: flex; gap: 24px; flex-wrap: wrap; align-items: flex-start; }
 .viewer { flex: 999 1 560px; min-width: 0; }
@@ -312,6 +437,22 @@ code { font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; padding: 1px 5
   background: var(--chip); display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; }
 .hints b { font-weight: 600; }
 
+.login { min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 120px 16px 48px; }
+.login main { width: 100%; max-width: 360px; display: flex; flex-direction: column; align-items: center; gap: 28px; }
+.login .mark { display: flex; flex-direction: column; align-items: center; gap: 14px; }
+.login h1 { font-size: 24px; line-height: 30px; font-weight: 700; letter-spacing: -.015em; }
+.login form { width: 100%; display: flex; flex-direction: column; gap: 12px; }
+.login label { font-size: 14px; line-height: 20px; font-weight: 600; }
+.login input { height: 48px; padding: 0 14px; border-radius: 12px; border: 1px solid var(--field-line);
+  background: var(--surface); color: var(--ink); font: inherit; font-size: 16px; }
+.login input::placeholder { color: var(--faint); }
+.login input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+.login .btn { min-height: 48px; font-size: 16px; }
+.login .error { display: flex; gap: 8px; align-items: flex-start; font-size: 14px; line-height: 20px; color: var(--warn); }
+.login .error svg { margin-top: 2px; }
+.login .help { font-size: 13px; line-height: 19px; color: var(--ink-3); }
+.login .hint { margin-top: 4px; text-align: center; font-size: 13px; line-height: 19px; color: var(--muted); }
+
 @media (max-width: 600px) {
   .wrap { padding-left: 16px; padding-right: 16px; }
   .library, .photo { padding-top: 16px; }
@@ -324,7 +465,9 @@ code { font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; padding: 1px 5
   .grid { grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 4px; }
   .tile { border-radius: 8px; }
   .frame.noimg { min-height: 320px; }
-  .notice { padding-top: 48px; }
+  .notice, .login { padding-top: 64px; }
+  .ways, .first .ways { padding: 4px 16px 0; }
+  .ways-note, .first .ways-note { padding: 12px 16px 0; }
   .card { padding: 24px; }
 }
 `;
@@ -338,6 +481,10 @@ const icon = (size: number, body: string, width = 1.8): string =>
 const ICON = {
   image: (size: number, width?: number) =>
     icon(size, '<rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="10" r="1.8"/><path d="M4 18l5-5 4 4 3-3 4 4"/>', width),
+  link: () =>
+    icon(20, '<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>'),
+  file: (size: number) =>
+    icon(size, '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/>', 1.6),
   qr: () =>
     icon(20, '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>' +
       '<rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM20 14v.01M14 20h.01M17 20h4v-3"/>'),
@@ -345,7 +492,7 @@ const ICON = {
   back: () => icon(16, '<path d="M15 6l-6 6 6 6"/>', 2.2),
   warn: () => icon(16, '<path d="M12 3l9 16H3z"/><path d="M12 10v4M12 17v.01"/>', 1.9),
   download: () => icon(17, '<path d="M12 4v11M7 10.5l5 5 5-5M5 20h14"/>', 2),
-  video: () => icon(17, '<rect x="3" y="6" width="13" height="12" rx="2"/><path d="M16 10l5-3v10l-5-3"/>', 1.9),
+  video: (size = 17) => icon(size, '<rect x="3" y="6" width="13" height="12" rx="2"/><path d="M16 10l5-3v10l-5-3"/>', 1.9),
   live: () => icon(11, '<circle cx="12" cy="12" r="3"/><circle cx="12" cy="12" r="7"/>', 2.2),
   lock: () => icon(24, '<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>'),
   clock: () => icon(24, '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>'),
@@ -396,21 +543,37 @@ function noticePage({ title, badge, tone = '', body, extra = '', action = 'Back 
 }
 
 const TOKEN_FILE_HINT =
-  `this server's token. Its operator can find it in the <code>token</code> file in the data directory.`;
+  `The password is this server's token. Its operator can find it in the <code>token</code> file in the data directory.`;
 
-const passwordPage = (hint?: string): string =>
-  noticePage({
-    title: 'Password required',
-    badge: ICON.lock(),
-    tone: 'accent',
-    body: `<p>You need a password to view the photos on this server.</p>`,
-    extra:
-      `<ul class="hints"><li><span><b>Username:</b> anything you like.</span></li>` +
-      `<li><span><b>Password:</b> ${hint === undefined ? TOKEN_FILE_HINT : esc(hint)}</span></li></ul>`,
-    action: 'Try again',
-  });
+interface LoginOptions {
+  next: string;
+  error?: 'wrong' | 'too_many';
+  hint?: string;
+  showsAppHint: boolean;
+}
 
-const PASSWORD_PAGE = passwordPage();
+function loginPage({ next, error, hint, showsAppHint }: LoginOptions): string {
+  const help = hint === undefined ? TOKEN_FILE_HINT : esc(hint);
+  const message =
+    error === 'too_many'
+      ? `<p class="error" role="alert">${ICON.warn()}<span>Too many attempts. Wait a minute, then try again.</span></p>`
+      : error === 'wrong'
+        ? `<p class="error" role="alert">${ICON.warn()}<span>That password isn't right.</span></p>` +
+          (help ? `<p class="help">${help}</p>` : '')
+        : '';
+  return shell(
+    'Sign in · LibrePixel',
+    `<div class="login"><main><div class="mark">${logo(48)}<h1>LibrePixel</h1></div>` +
+      `<form method="post" action="/login"><input type="hidden" name="next" value="${esc(next)}">` +
+      `<label for="password">Password</label>` +
+      `<input id="password" name="password" type="password" autocomplete="current-password" ` +
+      `placeholder="Server password" required autofocus>` +
+      message +
+      `<button class="btn" type="submit">Sign in</button>` +
+      (showsAppHint ? `<p class="hint">The same password connects the app.</p>` : '') +
+      `</form></main></div>`,
+  );
+}
 
 const TOO_MANY_PAGE = noticePage({
   title: 'Too many attempts',
@@ -456,7 +619,30 @@ document.querySelectorAll('[data-copy]').forEach(function (button) {
 });
 </script>`;
 
-function connectBody(ctx: ConnectContext): { hasQR: boolean; html: string } {
+function connectWays(ctx: ConnectContext): string {
+  if ((ctx.mode ?? 'bearer') !== 'bearer') return '';
+  const sources = ctx.sources ?? [];
+  const ways: Pick<AlbumSource, 'name' | 'connect'>[] = [
+    { name: 'LibrePixel', connect: [['Server', ctx.origin]] },
+    ...sources,
+  ];
+  return (
+    `<div class="ways">` +
+    ways
+      .map(
+        (way) =>
+          `<div class="way"><b>${esc(way.name)}</b>` +
+          way.connect.map(([label, value]) => `<div><span>${esc(label)}</span><code>${esc(value)}</code></div>`).join('') +
+          `</div>`,
+      )
+      .join('') +
+    `</div><p class="ways-note">` +
+    (sources.length ? 'Password everywhere: the one you signed in with.' : 'Password: the one you signed in with.') +
+    `</p>`
+  );
+}
+
+function connectBody(ctx: ConnectContext): { hasQR: boolean; hasWays: boolean; html: string } {
   const profile = buildProfile(ctx.origin, ctx.token, {
     mode: ctx.mode,
     maxUploadBytes: ctx.maxUploadBytes,
@@ -464,18 +650,23 @@ function connectBody(ctx: ConnectContext): { hasQR: boolean; html: string } {
   const code = encodeProfile(profile);
   const link = setupLink(code);
   const svg = ctx.setupQR === false ? '' : qrSvg(link, { scale: 4, margin: 3 });
+  const ways = connectWays(ctx);
   const second = svg
     ? ctx.first
       ? `Scan this QR code with your phone's camera, or copy the connection info and paste it into the app.`
       : `Scan this QR code, or copy the connection info below and paste it.`
     : `Copy the connection info below and paste it into the app.`;
+  const intro = ways
+    ? `<p class="or">${svg ? 'Or scan this QR code, or paste the connection info into the app.' : 'Or paste this connection info into the app.'}</p>`
+    : `<ol class="steps"><li><span>In the app, add a LibrePixel destination.</span></li>` +
+      `<li><span>${second}</span></li></ol>`;
   return {
     hasQR: Boolean(svg),
+    hasWays: Boolean(ways),
     html:
+      ways +
       `<div class="connect-body">${svg ? `<div class="qr">${svg}</div>` : ''}` +
-      `<div class="connect-info">` +
-      `<ol class="steps"><li><span>In the app, add a LibrePixel destination.</span></li>` +
-      `<li><span>${second}</span></li></ol>` +
+      `<div class="connect-info">${intro}` +
       `<div class="field"><label class="sr" for="connection-info">Connection info</label>` +
       `<input id="connection-info" readonly spellcheck="false" autocomplete="off" value="${esc(code)}" ` +
       `onfocus="this.select()">` +
@@ -489,12 +680,15 @@ function connectBody(ctx: ConnectContext): { hasQR: boolean; html: string } {
 function libraryHeader(count: number): string {
   return (
     `<header class="top"><div class="wrap">${brand()}` +
-    `<span class="count">${items(count)}</span>` +
+    `<span class="count">${items(count)}</span><span class="spacer"></span>` +
+    `<form class="signout" method="post" action="/logout"><button type="submit">Sign out</button></form>` +
     `</div></header>`
   );
 }
 
-function tile(row: RecentAsset): string {
+const sourceBadge = (name: string | undefined): string => (name ? `<span class="src">${esc(name)}</span>` : '');
+
+function tile(row: RecentAsset, source?: string): string {
   const ref = esc(row.ref);
   const name = esc(row.filename || row.ref);
   return (
@@ -502,12 +696,109 @@ function tile(row: RecentAsset): string {
     `<img loading="lazy" src="/v1/blob/${ref}" alt="${name}" ${FALLBACK}>` +
     `<span class="ph">${ICON.image(26, 1.6)}<span class="ph-name">${name}</span>` +
     `<span class="ph-note">No preview</span></span>` +
-    `${row.paired_hash ? liveBadge : ''}</a>`
+    `${row.paired_hash ? liveBadge : ''}${sourceBadge(source)}</a>`
   );
 }
 
-function gridPage(ctx: BrowseContext, rows: RecentAsset[], count: number): string {
-  if (rows.length === 0) {
+function fileTile(file: AlbumFile, source: string): string {
+  const name = esc(file.name);
+  if (file.kind === 'image') {
+    return (
+      `<a class="tile" href="${esc(file.url)}" title="${name}">` +
+      `<img loading="lazy" src="${esc(file.url)}" alt="${name}" ${FALLBACK}>` +
+      `<span class="ph">${ICON.image(26, 1.6)}<span class="ph-name">${name}</span>` +
+      `<span class="ph-note">No preview</span></span>${sourceBadge(source)}</a>`
+    );
+  }
+  const video = file.kind === 'video';
+  return (
+    `<a class="tile noimg" href="${esc(file.download)}" title="${name}" download>` +
+    `<span class="ph">${video ? ICON.video(26) : ICON.file(26)}<span class="ph-name">${name}</span>` +
+    `<span class="ph-note">${video ? 'Video · ' : ''}${esc(humanSize(file.size))} · Download</span></span>` +
+    `${sourceBadge(source)}</a>`
+  );
+}
+
+const LIBRARY_LIMIT = 200;
+const OWN_SOURCE = { id: 'librepixel', name: 'LibrePixel' };
+
+interface LibraryItem {
+  time: number;
+  tile: string;
+}
+
+interface Library {
+  /** Every source's total, for the header and the first-run page. */
+  count: number;
+  /** The selected tab's total. */
+  total: number;
+  items: LibraryItem[];
+  tabs: { id: string; name: string; total: number }[];
+  selected: string;
+}
+
+const assetTime = (row: Pick<RecentAsset, 'captured_at' | 'uploaded_at'>): number =>
+  Number(row.captured_at) || Number(row.uploaded_at) || 0;
+
+async function loadLibrary(ctx: BrowseContext, url: URL): Promise<Library> {
+  const sources = ctx.sources ?? [];
+  const [rows, count, ...lists] = await Promise.all([
+    ctx.index.recent(LIBRARY_LIMIT),
+    ctx.index.countAssets(),
+    ...sources.map((source) => source.files(LIBRARY_LIMIT)),
+  ]);
+  const badge = sources.length ? OWN_SOURCE.name : undefined;
+  const own = rows.map((row) => ({ time: assetTime(row), tile: tile(row, badge) }));
+  if (!sources.length) return { count, total: count, items: own, tabs: [], selected: 'all' };
+
+  const all = count + lists.reduce((sum, list) => sum + list.total, 0);
+  const tabs = [
+    { id: 'all', name: 'All', total: all },
+    { ...OWN_SOURCE, total: count },
+    ...sources.map((source, at) => ({ id: source.id, name: source.name, total: lists[at].total })),
+  ];
+  const wanted = url.searchParams.get('source');
+  const selected = tabs.find((tab) => tab.id === wanted)?.id ?? 'all';
+  const items: LibraryItem[] = selected === 'all' || selected === OWN_SOURCE.id ? [...own] : [];
+  sources.forEach((source, at) => {
+    if (selected !== 'all' && selected !== source.id) return;
+    for (const file of lists[at].files) items.push({ time: Number(file.uploadedAt) || 0, tile: fileTile(file, source.name) });
+  });
+  items.sort((a, b) => b.time - a.time);
+  return {
+    count: all,
+    total: tabs.find((tab) => tab.id === selected)?.total ?? all,
+    items: items.slice(0, LIBRARY_LIMIT),
+    tabs,
+    selected,
+  };
+}
+
+function monthLabel(sec: number): string {
+  if (sec <= 0) return 'Undated';
+  const d = new Date(sec * 1000);
+  return `${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
+}
+
+function tabsNav(library: Library): string {
+  if (!library.tabs.length) return '';
+  return (
+    `<nav class="tabs" aria-label="Source">` +
+    library.tabs
+      .map(
+        (tab) =>
+          `<a class="tab" href="${tab.id === 'all' ? '/' : `/?source=${encodeURIComponent(tab.id)}`}"` +
+          `${tab.id === library.selected ? ' aria-current="page"' : ''}>${esc(tab.name)}` +
+          `<span>${Number(tab.total).toLocaleString('en-US')}</span></a>`,
+      )
+      .join('') +
+    `</nav>`
+  );
+}
+
+function gridPage(ctx: BrowseContext, library: Library): string {
+  const { count, total, items: rows } = library;
+  if (count === 0) {
     const connect = connectBody({ ...ctx, first: true });
     return shell(
       'LibrePixel',
@@ -520,9 +811,9 @@ function gridPage(ctx: BrowseContext, rows: RecentAsset[], count: number): strin
     );
   }
 
-  const groups: { month: string; rows: RecentAsset[] }[] = [];
+  const groups: { month: string; rows: LibraryItem[] }[] = [];
   for (const row of rows) {
-    const month = monthOf(row);
+    const month = monthLabel(row.time);
     let group = groups.at(-1);
     if (group?.month !== month) {
       group = { month, rows: [] };
@@ -530,31 +821,36 @@ function gridPage(ctx: BrowseContext, rows: RecentAsset[], count: number): strin
     }
     group.rows.push(row);
   }
-  const truncated = rows.length < count;
-  const sections = groups
-    .map((group, at) => {
-      const partial = truncated && at === groups.length - 1;
-      return (
-        `<section class="month"><div class="month-head"><h2>${esc(group.month)}</h2>` +
-        (partial ? '' : `<span>${items(group.rows.length)}</span>`) +
-        `</div><div class="grid">${group.rows.map(tile).join('')}</div></section>`
-      );
-    })
-    .join('');
+  const truncated = rows.length < total;
+  const selectedName = library.tabs.find((tab) => tab.id === library.selected)?.name;
+  const sections = rows.length
+    ? groups
+        .map((group, at) => {
+          const partial = truncated && at === groups.length - 1;
+          return (
+            `<section class="month"><div class="month-head"><h2>${esc(group.month)}</h2>` +
+            (partial ? '' : `<span>${items(group.rows.length)}</span>`) +
+            `</div><div class="grid">${group.rows.map((row) => row.tile).join('')}</div></section>`
+          );
+        })
+        .join('')
+    : `<div class="nothing">${ICON.image(20, 1.6)}<span>Nothing from ${esc(selectedName)} yet.</span></div>`;
 
   const connect = connectBody(ctx);
+  const subtitle = connect.hasWays
+    ? ''
+    : `<span>${connect.hasQR ? 'Scan the QR code or paste the connection info' : 'Paste the connection info'}</span>`;
   const panel =
-    `<details class="connect"><summary>${ICON.qr()}` +
-    `<span class="titles"><b>Connect the app</b><span>` +
-    `${connect.hasQR ? 'Scan the QR code or paste the connection info' : 'Paste the connection info'}` +
-    `</span></span>${ICON.chevron()}</summary>${connect.html}</details>`;
+    `<details class="connect"><summary>${connect.hasWays ? ICON.link() : ICON.qr()}` +
+    `<span class="titles"><b>Connect the app</b>${subtitle}</span>` +
+    `${ICON.chevron()}</summary>${connect.html}</details>`;
 
   return shell(
     'LibrePixel',
     libraryHeader(count) +
-      `<main class="wrap library">${panel}${sections}` +
+      `<main class="wrap library">${panel}${tabsNav(library)}${sections}` +
       (truncated
-        ? `<p class="more">Showing the latest ${items(rows.length)} of ${Number(count).toLocaleString('en-US')}.</p>`
+        ? `<p class="more">Showing the latest ${items(rows.length)} of ${Number(total).toLocaleString('en-US')}.</p>`
         : '') +
       `</main>` +
       COPY_SCRIPT,
@@ -615,24 +911,55 @@ export async function handleBrowse(
   ctx: BrowseContext,
 ): Promise<void> {
   const path = url.pathname;
+  const secure = ctx.secureCookie ?? ctx.origin.startsWith('https:');
+  const showsAppHint = (ctx.mode ?? 'bearer') === 'bearer';
 
   if (path === '/favicon.ico') {
     res.writeHead(204).end();
     return;
   }
 
-  if (!browseAuthorized(req, ctx.token)) {
+  if (path === '/logout') {
+    redirect(res, '/login', { 'set-cookie': clearedCookie(secure) });
+    return;
+  }
+
+  const authorized = browseAuthorized(req, ctx.token, ctx.sessionSecret);
+
+  if (path === '/login') {
+    if (req.method !== 'POST') {
+      const next = safeNext(url.searchParams.get('next'));
+      if (authorized) redirect(res, next);
+      else send(res, 200, loginPage({ next, showsAppHint }));
+      return;
+    }
     if (ctx.limiter && !ctx.limiter.check(`browse:${ctx.clientIp ?? 'local'}`)) {
+      send(res, 429, loginPage({ next: '/', error: 'too_many', showsAppHint }), { 'retry-after': '60' });
+      return;
+    }
+    const form = await readForm(req);
+    const next = safeNext(form?.get('next'));
+    if (form && sameSecret(form.get('password') ?? '', ctx.token)) {
+      redirect(res, next, { 'set-cookie': sessionCookie(ctx.token, ctx.sessionSecret, secure) });
+    } else {
+      send(res, 401, loginPage({ next, error: 'wrong', hint: ctx.passwordHint, showsAppHint }));
+    }
+    return;
+  }
+
+  if (!authorized) {
+    if (presentsCredential(req) && ctx.limiter && !ctx.limiter.check(`browse:${ctx.clientIp ?? 'local'}`)) {
       send(res, 429, TOO_MANY_PAGE, { 'retry-after': '60' });
       return;
     }
-    send(res, 401, ctx.passwordHint === undefined ? PASSWORD_PAGE : passwordPage(ctx.passwordHint), { 'www-authenticate': 'Basic realm="LibrePixel", charset="UTF-8"' });
+    const next = safeNext(path + url.search);
+    if (path === '/' || path.startsWith('/photo/')) redirect(res, `/login?next=${encodeURIComponent(next)}`);
+    else send(res, 401, loginPage({ next, showsAppHint }));
     return;
   }
 
   if (path === '/') {
-    const [rows, count] = await Promise.all([ctx.index.recent(), ctx.index.countAssets()]);
-    send(res, 200, gridPage(ctx, rows, count));
+    send(res, 200, gridPage(ctx, await loadLibrary(ctx, url)));
     return;
   }
 
@@ -653,6 +980,11 @@ export async function handleBrowse(
   }
 
   send(res, 404, NOT_FOUND_PAGE);
+}
+
+function redirect(res: BrowseResponse, location: string, headers: Record<string, string> = {}): void {
+  res.writeHead(303, { location, 'content-length': '0', ...headers });
+  res.end();
 }
 
 async function sendBlob(req: BrowseRequest, res: BrowseResponse, url: URL, ctx: BrowseContext): Promise<void> {

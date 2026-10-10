@@ -115,7 +115,7 @@ Flags take precedence over the environment.
 
 - **Use HTTPS for internet access.** LibrePixel speaks plain HTTP. Put it behind an HTTPS reverse proxy, set `--origin` to the public `https://` address, and pass `--trust-proxy`. Plain HTTP is only for a trusted local network.
 - **The token is the master secret.** It is generated on first start and stored in `<dir>/token` (mode 600). It is the browse password and is inside the connection info. To revoke it, stop the server, delete the file, start again, and reconnect the app with the new connection info.
-- **Browse page.** It uses HTTP Basic auth: any username, and the token as the password. Wrong guesses are rate limited.
+- **Browse page.** Sign in with the token as the password. The page sets a signed, HttpOnly, SameSite=Lax session cookie for 30 days (Secure when the origin is https); changing the token signs everyone out. Scripts can still send the token as Bearer or Basic auth. Wrong guesses are rate limited.
 - **Device keys.** With `--auth exchange`, the token alone cannot upload; it must be exchanged for a 1-hour session. After the first device binds a key, the exchange also needs a signature from a bound device, and the session token is returned encrypted to that device. Use `librepixel devices` to list bound keys and `librepixel unbind <issuer>` (or `all`) to remove them. After `unbind all`, the next device can bind with just the connection info.
 
 What is stored in the data directory:
@@ -156,7 +156,7 @@ Control endpoints take `POST` with a protobuf body and return protobuf. Errors a
 **Other**
 
 - `GET /v1/health` returns `ok` without auth.
-- `GET /`, `GET /photo/<sha256>`, `GET /v1/blob/<sha256>[?download=1]`: the browse page and original files, using the token as Basic or Bearer auth ([`src/browse.ts`](src/browse.ts)).
+- `GET /`, `GET /photo/<sha256>`, `GET /v1/blob/<sha256>[?download=1]`: the browse page and original files, using the session cookie from `GET`/`POST /login` (`password=<token>`), or the token as Basic or Bearer auth. `POST /logout` clears the cookie ([`src/browse.ts`](src/browse.ts)).
 
 The protobuf field numbers are in [`src/handler.ts`](src/handler.ts); the encoder and decoder are in [`src/protobuf.ts`](src/protobuf.ts). The tests in [`test/`](test) cover each flow end to end, and [`test/support.ts`](test/support.ts) has the client-side helpers they use.
 

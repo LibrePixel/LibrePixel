@@ -98,11 +98,11 @@ test('browse pages: wrong guesses are rate limited, successful logins are not co
     const statuses = [];
     let lastPage = '';
     for (let i = 0; i < 35; i++) {
-      const res = await fetch(`${fresh.origin}/`, { headers: wrong });
+      const res = await fetch(`${fresh.origin}/`, { headers: wrong, redirect: 'manual' });
       statuses.push(res.status);
       lastPage = await res.text();
     }
-    assert.ok(statuses.slice(0, 30).every((s) => s === 401));
+    assert.ok(statuses.slice(0, 30).every((s) => s === 303), 'a wrong guess is sent to the sign-in page');
     assert.ok(statuses.slice(30).every((s) => s === 429), '429 after too many wrong guesses');
     assert.match(lastPage, /Too many attempts/, '429 returns an explanatory page, not a bare status');
   } finally {
