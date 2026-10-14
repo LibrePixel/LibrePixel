@@ -55,10 +55,15 @@ async function putBytes(uploadId: string | null, bytes: Uint8Array) {
   return { status: put.status, echoed: new Uint8Array(await put.arrayBuffer()) };
 }
 
-const UPLOADED_AT = 1_757_000_000;
+const PHOTO_DATE = 1_680_000_000;
 const CAPTURED_AT = 1_690_000_000;
 
-async function upload(bytes: Buffer, filename: string, pairedBytes?: Buffer) {
+async function upload(
+  bytes: Buffer,
+  filename: string,
+  pairedBytes?: Buffer,
+  timestamps = new Writer().varint(1, PHOTO_DATE).varint(3, CAPTURED_AT),
+) {
   const digest = sha256(bytes);
 
   const { status, uploadId } = await requestUpload(bytes.length, digest);
@@ -73,7 +78,7 @@ async function upload(bytes: Buffer, filename: string, pairedBytes?: Buffer) {
     .bytes(1, put.echoed)
     .string(2, filename)
     .bytes(3, digest)
-    .message(4, new Writer().varint(1, UPLOADED_AT).varint(3, CAPTURED_AT))
+    .message(4, timestamps)
     .varint(10, 1);
   if (pairedBytes) {
     const pairedDigest = sha256(pairedBytes);
@@ -197,13 +202,24 @@ test('a storage error means unconfirmed, not missing', async () => {
   assert.equal((decode(new Uint8Array(await have.arrayBuffer())).get(1) ?? []).length, 1);
 });
 
-test('capture time and upload time are stored separately', async () => {
-  const bytes = randomBytes(1024);
-  const { ref } = await upload(bytes, 'IMG_0003.HEIC');
+test('capture time comes from 1.4.3 and upload time is when the server received the commit', async () => {
+  const before = Math.floor(Date.now() / 1000);
+  const { ref } = await upload(randomBytes(1024), 'IMG_0003.HEIC');
+  const after = Math.floor(Date.now() / 1000);
 
   const row = (await running.index.recent(50)).find((r) => r.ref === ref);
   assert.equal(row?.captured_at, CAPTURED_AT, '1.4.3 is the capture time');
-  assert.equal(row?.uploaded_at, UPLOADED_AT, '1.4.1 is the upload time, not the capture time');
+  assert.ok(
+    row && row.uploaded_at >= before && row.uploaded_at <= after,
+    `uploaded_at ${row?.uploaded_at} is the server's clock, not 1.4.1`,
+  );
+});
+
+test('without 1.4.3 the capture time is 1.4.1', async () => {
+  const { ref } = await upload(randomBytes(1024), 'IMG_0006.PNG', undefined, new Writer().varint(1, PHOTO_DATE));
+
+  const row = (await running.index.recent(50)).find((r) => r.ref === ref);
+  assert.equal(row?.captured_at, PHOTO_DATE);
 });
 
 test('an empty have query gets an empty answer', async () => {
@@ -284,7 +300,7 @@ test('staged bytes are rejected when the commit digest does not match', async ()
     .bytes(1, put.echoed)
     .string(2, 'IMG_0004.HEIC')
     .bytes(3, sha256(randomBytes(8)))
-    .message(4, new Writer().varint(1, UPLOADED_AT))
+    .message(4, new Writer().varint(1, PHOTO_DATE))
     .varint(10, 1);
   const committed = await post('/v1/commit', new Writer().message(1, main).buffer);
   assert.equal(committed.status, 409);
@@ -304,7 +320,7 @@ test('a commit whose paired video was never staged is rejected', async () => {
     .bytes(1, put.echoed)
     .string(2, 'IMG_0005.HEIC')
     .bytes(3, photoDigest)
-    .message(4, new Writer().varint(1, UPLOADED_AT))
+    .message(4, new Writer().varint(1, PHOTO_DATE))
     .varint(10, 1)
     .message(24, paired);
 
@@ -340,7 +356,7 @@ test('a live photo commits its still and video together', async () => {
     .bytes(1, photoEchoed)
     .string(2, 'IMG_0002.HEIC')
     .bytes(3, photoDigest)
-    .message(4, new Writer().varint(1, UPLOADED_AT).varint(3, CAPTURED_AT))
+    .message(4, new Writer().varint(1, PHOTO_DATE).varint(3, CAPTURED_AT))
     .varint(10, 1)
     .message(24, paired);
 

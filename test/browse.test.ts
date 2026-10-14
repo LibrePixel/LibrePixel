@@ -51,7 +51,7 @@ async function uploadPhoto(bytes: Buffer, filename: string) {
     .bytes(1, echoed)
     .string(2, filename)
     .bytes(3, digest)
-    .message(4, new Writer().varint(1, 1_757_000_000).varint(3, 1_690_000_000))
+    .message(4, new Writer().varint(1, 1_690_000_000).varint(3, 1_690_000_000))
     .varint(10, 1);
   await commit(main);
   return digest.toString('hex');
@@ -65,7 +65,7 @@ async function uploadLivePhoto(photo: Buffer, video: Buffer, filename: string) {
     .bytes(1, p.echoed)
     .string(2, filename)
     .bytes(3, p.digest)
-    .message(4, new Writer().varint(1, 1_757_000_000).varint(3, 1_690_000_000))
+    .message(4, new Writer().varint(1, 1_690_000_000).varint(3, 1_690_000_000))
     .varint(10, 1)
     .message(24, paired);
   await commit(main);
@@ -282,7 +282,7 @@ test('other sources: their files join the library with source labels, tabs and c
     const put = await fetch(`${fresh.origin}/v1/upload?upload_id=${ticket.headers.get('x-upload-id')}`, { method: 'PUT', body: bytes });
     const echoed = new Uint8Array(await put.arrayBuffer());
     const main = new Writer().bytes(1, echoed).string(2, 'OWN.JPG').bytes(3, digest)
-      .message(4, new Writer().varint(1, 1_757_000_000).varint(3, 1_690_000_000));
+      .message(4, new Writer().varint(1, 1_690_000_000).varint(3, 1_690_000_000));
     await fetch(`${fresh.origin}/v1/commit`, {
       method: 'POST', headers: { authorization: `Bearer ${fresh.token}` }, body: new Writer().message(1, main).buffer,
     });
@@ -451,7 +451,8 @@ test('photo page: the original can be downloaded', async () => {
   assertEnglishOnly(html, 'photo page');
   assert.match(html, /Download original/);
   assert.match(html, /Taken Jul 22, 2023 at 04:26 UTC/);
-  assert.match(html, /<dt>Uploaded<\/dt><dd>Sep 4, 2025 at \d\d:\d\d UTC<\/dd>/);
+  const today = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' });
+  assert.match(html, new RegExp(`<dt>Uploaded</dt><dd>${today} at \\d\\d:\\d\\d UTC</dd>`), 'uploaded is when the server received it');
   assert.match(html, new RegExp(`<span class="mono">${ref}</span>`), 'checksum');
   assert.match(html, /No preview for JPG/, 'placeholder when the browser cannot preview');
 });

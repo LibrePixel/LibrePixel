@@ -225,8 +225,9 @@ async function commit(body: Uint8Array, ctx: HandlerContext): Promise<Response> 
   const hash = payloadAt(main, [3]);
   if (!hash || bytesToHex(hash) !== staged.hash) return fail(409, 'hash_mismatch');
 
-  const uploadedAt = Number(varintAt(main, [4, 1]) ?? 0n);
-  const capturedAt = Number(varintAt(main, [4, 3]) ?? 0n);
+  // 1.4.1 is the client's date for the photo, not when it was sent, so the upload time is this server's clock.
+  const uploadedAt = Math.floor(Date.now() / 1000);
+  const capturedAt = Number(varintAt(main, [4, 3]) ?? varintAt(main, [4, 1]) ?? 0n);
 
   const pairedBlock = payloadAt(main, [24]);
   let paired: PairedVideo | null = null;
